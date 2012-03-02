@@ -9,6 +9,51 @@ import requests as http
 import os
 from pydas.exceptions import PydasException
 
+
+
+# here are the problems with this authentication_retry implementation:
+# 1) created this as a decorator, but there may be no need, as we
+# can do all this work in the request method, which is the only
+# method decorated.  That assume we can keep all the state we need
+# in this file, see the next point.
+# 2) in order to reauthenticate, we need the params to login,
+# which I've stored in the BaseDriver, but because I capture them
+# after a login, I'm stealing them from the CoreDriver when a login
+# is called.  Any other BaseDriver subclass won't actually have
+# the login params, so if a request occurs in another BaseDriver subclass
+# that requires reauthentication, this current structure won't allow for it.
+
+
+
+
+def authentication_retry(fn):
+    """
+    this decorator will detect a stale token and renew the token if possible,
+    then retry the failed api call.
+    """
+    from functools import wraps
+    @wraps(fn)
+    def wrapper(*args, **kw):
+        try:
+            return fn(*args, **kw)
+        except PydasException as pe:
+            if pe.value.find('Invalid token') > -1:
+                # renew the token
+                # get the instance of the CoreDriver and set it as "that"
+                that = args[0]
+                that._token = that.login_with_api_key(that._email, that._apikey)
+                # now fix up the arguments of the original call to use the renewed token
+                argsList = list(args)
+                argsList[2]['token'] = that._token
+                args = tuple(argsList)
+                # try the api call again
+                return fn(*args, **kw)
+            else:
+                raise pe
+    return wrapper 
+
+
+
 class BaseDriver(object):
     """
     Base class for the midas api drivers.
@@ -21,6 +66,9 @@ class BaseDriver(object):
         self._api_suffix = '/api/json?method='
         self._url = url
         self._debug = False
+        self._email = None
+        self._apikey = None
+        self._token = None
 
     @property
     def url(self):
@@ -43,6 +91,7 @@ class BaseDriver(object):
         """
         return self._url + self._api_suffix
 
+    @authentication_retry
     def request(self, method, parameters=None, file_payload=None):
         """Do the generic processing of a request to the server.
 
@@ -130,6 +179,10 @@ class CoreDriver(BaseDriver):
         parameters['apikey'] = apikey
         parameters['appname'] = application
         response = self.request('midas.login', parameters)
+        # capture the authentication params
+        self._email = email
+        self._apikey = apikey
+        self._token  = response['token']
         return response['token']
 
     def list_user_folders(self, token):
@@ -290,6 +343,7 @@ class BatchmakeDriver(BaseDriver):
         parameters['outfilename'] = dagmanoutfilename
         response = self.request('midas.batchmake.add.condor.dag', parameters)
         return response
+
 
     def add_condor_job(self, token, batchmaketaskid, jobdefinitionfilename, outputfilename, errorfilename, logfilename, postfilename):
         """
